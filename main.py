@@ -4,6 +4,7 @@ import random
 import threading
 import time
 import tkinter as tk
+import urllib.request
 
 import cv2
 import mediapipe as mp
@@ -11,6 +12,10 @@ from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+)
 
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
