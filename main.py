@@ -182,6 +182,29 @@ def draw_skeleton(frame, result):
         cv2.line(frame, points[start], points[end], (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def ensure_model_downloaded(path, url):
+    """
+    Downloads the MediaPipe model file if it isn't already present locally.
+    Streams to a .part file first and renames on success, so an interrupted
+    download can't leave a corrupt model file at the real path.
+    """
+    if os.path.exists(path):
+        return
+
+    print(f"Model not found at {path}, downloading from {url} ...")
+    tmp_path = path + ".part"
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        os.replace(tmp_path, path)
+        print("Model download complete.")
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+ensure_model_downloaded(MODEL_PATH, MODEL_URL)
+
 options = vision.PoseLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=MODEL_PATH),
     running_mode=vision.RunningMode.VIDEO,
