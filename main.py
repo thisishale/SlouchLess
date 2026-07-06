@@ -15,6 +15,8 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task"
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
 MIN_NOSE_NECK_DISTANCE_PX = 35
+NO_PERSON_DISABLE_TIMEOUT_SEC = 30
+MIN_PERSON_PRESENCE_VISIBILITY = 0.6
 
 BAD_POSTURE_MESSAGES = [
     "I would sit right if I were you!",
@@ -106,6 +108,24 @@ def _estimate_neck(landmarks, frame_width, frame_height):
     }
 
 
+def is_person_present(selected):
+    """
+    In VIDEO mode MediaPipe tracks the previous detection instead of re-running
+    full detection every frame, so it can lock onto a static background object
+    (a chair, a coat on a hook) and keep reporting it as a person indefinitely.
+    Requiring decent visibility on the core landmarks filters most of those out,
+    since a real person's shoulders/nose are confidently visible while a
+    misidentified object's landmarks tend to be low-confidence guesses.
+    """
+    if selected is None:
+        return False
+
+    core = (selected["nose"], selected["left_shoulder"], selected["right_shoulder"])
+    avg_visibility = sum(lm["visibility"] for lm in core) / len(core)
+
+    return avg_visibility >= MIN_PERSON_PRESENCE_VISIBILITY
+
+
 def neck_shoulder_angle(selected):
     """
     Interior angle at the neck vertex formed by the segments
@@ -172,6 +192,8 @@ if not cap.isOpened():
 
 last_print_time = time.time()
 last_posture_alert_time = 0.0
+last_person_seen_time = time.time()
+monitoring_enabled = True
 
 
 def _show_posture_popup(message):
@@ -229,6 +251,12 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
 
         selected = extract_landmarks(result, frame_width, frame_height)
 
+        if is_person_present(selected):
+            last_person_seen_time = time.time()
+            monitoring_enabled = True
+        elif time.time() - last_person_seen_time >= NO_PERSON_DISABLE_TIMEOUT_SEC:
+            monitoring_enabled = False
+
         if selected is not None:
             # Draw only posture-relevant points with labels
             for name, data in selected.items():
@@ -255,7 +283,8 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
             nose_neck_distance = math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"])
 
             if (
-                vertex_angle is not None
+                monitoring_enabled
+                and vertex_angle is not None
                 and vertex_angle > NECK_VERTEX_ALERT_THRESHOLD_DEG
                 and nose_neck_distance >= MIN_NOSE_NECK_DISTANCE_PX
             ):
@@ -306,6 +335,18 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
                 for line in overlay_lines:
                     print(line)
                 last_print_time = now
+
+        if not monitoring_enabled:
+            cv2.putText(
+                frame,
+                "Posture monitoring paused - no person detected",
+                (10, frame_height - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
         cv2.imshow("Live Pose Landmark Extraction", frame)
 
