@@ -33,5 +33,8 @@ Thumbs.db
 .idea/
 *.swp
 
+# # MediaPipe model files
+# *.task
+
 # Logs
 *.log
