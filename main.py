@@ -20,6 +20,7 @@ MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
+CALIBRATION_ICON_PATH = os.path.join(os.path.dirname(__file__), "images", "SlouchImage.png")
 # default is 123.
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
@@ -368,6 +369,14 @@ class CalibrationWindow:
         self.root.title("Posture Calibration")
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        try:
+            # Keep a reference on self - Tk doesn't hold one, so the image
+            # would otherwise get garbage collected and the icon would vanish.
+            self._icon_image = tk.PhotoImage(file=CALIBRATION_ICON_PATH)
+            self.root.iconphoto(True, self._icon_image)
+        except tk.TclError:
+            pass
 
         self.message_label = tk.Label(self.root, text="", wraplength=380, justify="center", font=("Segoe UI", 12))
         self.message_label.pack(expand=True, fill="both", padx=20, pady=(20, 10))
