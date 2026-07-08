@@ -1,3 +1,4 @@
+import ctypes
 import json
 import math
 import os
@@ -28,15 +29,45 @@ def resource_path(*parts):
     return os.path.join(base_dir, *parts)
 
 
+def set_window_icon(window_title, icon_path):
+    """
+    OpenCV's highgui windows use a hardcoded icon baked into its own DLL and
+    expose no API to change it, so the title-bar/taskbar icon has to be set
+    directly via the Win32 API on the specific window instance instead.
+    """
+    IMAGE_ICON = 1
+    LR_LOADFROMFILE = 0x00000010
+    WM_SETICON = 0x0080
+    ICON_SMALL = 0
+    ICON_BIG = 1
+
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, window_title)
+        if not hwnd:
+            return
+        hicon_big = user32.LoadImageW(None, icon_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+        hicon_small = user32.LoadImageW(None, icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        if hicon_big:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+        if hicon_small:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+    except (AttributeError, OSError):
+        pass
+
+
 MODEL_PATH = resource_path("pose_landmarker_lite.task")
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
 CALIBRATION_ICON_PATH = resource_path("images", "SlouchImageopt.png")
+APP_ICON_PATH = resource_path("images", "SlouchLess.ico")
+VIDEO_WINDOW_NAME = "SlouchLess"
 # default is 123.
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
+SUSTAINED_BAD_POSTURE_SEC = 4
 MIN_NOSE_NECK_DISTANCE_PX = 35
 NO_PERSON_DISABLE_TIMEOUT_SEC = 30
 MIN_PERSON_PRESENCE_VISIBILITY = 0.6
@@ -329,6 +360,7 @@ last_print_time = time.time()
 last_posture_alert_time = 0.0
 last_person_seen_time = time.time()
 monitoring_enabled = True
+bad_posture_since = None
 
 
 def _show_posture_popup(message):
@@ -381,7 +413,7 @@ class CalibrationWindow:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Posture Calibration")
+        self.root.title("SlouchLess Calibration")
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -751,6 +783,9 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
     finally:
         calib_window.close()
 
+    cv2.namedWindow(VIDEO_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    set_window_icon(VIDEO_WINDOW_NAME, APP_ICON_PATH)
+
     while True:
         ret, frame = cap.read()
 
@@ -803,16 +838,25 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
             cva_angle = angle_from_horizontal(neck, nose)
             nose_neck_distance = math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"])
 
-            if (
+            is_bad_posture_frame = (
                 monitoring_enabled
                 and vertex_angle is not None
                 and vertex_angle > NECK_VERTEX_ALERT_THRESHOLD_DEG
                 and nose_neck_distance >= MIN_NOSE_NECK_DISTANCE_PX
-            ):
-                now = time.time()
-                if now - last_posture_alert_time > NECK_VERTEX_ALERT_COOLDOWN_SEC:
+            )
+
+            now = time.time()
+            if is_bad_posture_frame:
+                if bad_posture_since is None:
+                    bad_posture_since = now
+                elif (
+                    now - bad_posture_since >= SUSTAINED_BAD_POSTURE_SEC
+                    and now - last_posture_alert_time > NECK_VERTEX_ALERT_COOLDOWN_SEC
+                ):
                     alert_bad_posture(vertex_angle)
                     last_posture_alert_time = now
+            else:
+                bad_posture_since = None
 
             cv2.line(frame, (selected["left_shoulder"]["px"], selected["left_shoulder"]["py"]), (neck["px"], neck["py"]), (0, 200, 255), 2)
             cv2.line(frame, (neck["px"], neck["py"]), (selected["right_shoulder"]["px"], selected["right_shoulder"]["py"]), (0, 200, 255), 2)
@@ -869,13 +913,13 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
                 cv2.LINE_AA,
             )
 
-        cv2.imshow("Live Pose Landmark Extraction", frame)
+        cv2.imshow(VIDEO_WINDOW_NAME, frame)
 
         # Press q to quit
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-        if cv2.getWindowProperty("Live Pose Landmark Extraction", cv2.WND_PROP_VISIBLE) < 1:
+        if cv2.getWindowProperty(VIDEO_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             break
 
 cap.release()
