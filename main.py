@@ -3,6 +3,7 @@ import math
 import os
 import random
 import statistics
+import sys
 import threading
 import time
 import tkinter as tk
@@ -15,12 +16,24 @@ from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 from pycaw.pycaw import AudioUtilities
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task")
+
+def resource_path(*parts):
+    """
+    Resolves a path to a bundled, read-only resource (model file, icon image).
+    Works both running from source and when frozen into a PyInstaller exe,
+    where bundled data is extracted under sys._MEIPASS instead of living next
+    to the script.
+    """
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, *parts)
+
+
+MODEL_PATH = resource_path("pose_landmarker_lite.task")
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
-CALIBRATION_ICON_PATH = os.path.join(os.path.dirname(__file__), "images", "SlouchImageopt.png")
+CALIBRATION_ICON_PATH = resource_path("images", "SlouchImageopt.png")
 # default is 123.
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
@@ -28,7 +41,9 @@ MIN_NOSE_NECK_DISTANCE_PX = 35
 NO_PERSON_DISABLE_TIMEOUT_SEC = 30
 MIN_PERSON_PRESENCE_VISIBILITY = 0.6
 
-CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
+CALIBRATION_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PostureBooster")
+os.makedirs(CALIBRATION_DIR, exist_ok=True)
+CALIBRATION_FILE = os.path.join(CALIBRATION_DIR, "calibration.json")
 UPRIGHT_STEP_RECORDING_SEC = 5
 SLOUCH_STEP_RECORDING_SEC = 10
 CALIBRATION_WINDOW_NAME = "Posture Calibration"
@@ -389,10 +404,11 @@ class CalibrationWindow:
 
         self._response = None
         self.closed = False
+        self._destroyed = False
 
     def _on_close(self):
-        self.closed = True
         self._response = False
+        self.close()
 
     def pump(self):
         if self.closed:
@@ -402,6 +418,7 @@ class CalibrationWindow:
             self.root.update()
         except tk.TclError:
             self.closed = True
+            self._destroyed = True
 
     def _autosize(self):
         """
@@ -422,6 +439,7 @@ class CalibrationWindow:
             self.root.geometry(f"{width}x{height}+{x}+{y}")
         except tk.TclError:
             self.closed = True
+            self._destroyed = True
 
     def set_message(self, text):
         self.message_label.config(text=text)
@@ -477,12 +495,14 @@ class CalibrationWindow:
         return bool(self._wait_for_response())
 
     def close(self):
-        if not self.closed:
-            try:
-                self.root.destroy()
-            except tk.TclError:
-                pass
-            self.closed = True
+        if self._destroyed:
+            return
+        self._destroyed = True
+        self.closed = True
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 def _play_beep():
@@ -541,6 +561,9 @@ def _run_calibration_countdown(cap, landmarker, calib_window, phase_title, instr
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
 
+        if cv2.getWindowProperty(CALIBRATION_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            return False
+
 
 def _run_calibration_recording(cap, landmarker, calib_window, phase_title, instruction, duration_sec, angles, distances):
     """
@@ -579,6 +602,9 @@ def _run_calibration_recording(cap, landmarker, calib_window, phase_title, instr
             return False
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
+            return False
+
+        if cv2.getWindowProperty(CALIBRATION_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             return False
 
 
@@ -847,6 +873,9 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
 
         # Press q to quit
         if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+        if cv2.getWindowProperty("Live Pose Landmark Extraction", cv2.WND_PROP_VISIBLE) < 1:
             break
 
 cap.release()
