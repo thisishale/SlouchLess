@@ -20,7 +20,7 @@ MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
-CALIBRATION_ICON_PATH = os.path.join(os.path.dirname(__file__), "images", "SlouchImage.png")
+CALIBRATION_ICON_PATH = os.path.join(os.path.dirname(__file__), "images", "SlouchImageopt.png")
 # default is 123.
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
