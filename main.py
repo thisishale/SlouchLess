@@ -29,8 +29,8 @@ NO_PERSON_DISABLE_TIMEOUT_SEC = 30
 MIN_PERSON_PRESENCE_VISIBILITY = 0.6
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
-UPRIGHT_STEP_RECORDING_SEC = 7.5
-SLOUCH_STEP_RECORDING_SEC = 6
+UPRIGHT_STEP_RECORDING_SEC = 5
+SLOUCH_STEP_RECORDING_SEC = 10
 CALIBRATION_WINDOW_NAME = "Posture Calibration"
 CALIBRATION_PREP_COUNTDOWN_SEC = 5
 BEEP_FREQUENCY_HZ = 800
@@ -631,7 +631,8 @@ def run_calibration(cap, landmarker, calib_window):
         "Sit upright, look straight ahead",
         "Slowly turn your head left",
         "Slowly turn your head right",
-        "Look down slightly, chin tucked",
+        "Look down slightly (enough to see keyboard and front of you), with upright position",
+        "Rest your chin/head on your hand, elbow on desk, staying upright",
     ]
     slouch_steps = [
         "Slouch forward",
@@ -684,11 +685,13 @@ def run_calibration(cap, landmarker, calib_window):
             calib_window.set_countdown("")
         return None, None
 
-    threshold = ((slouch_mean + slouch_std) + (upright_mean - upright_std)) / 2
+    threshold = ((slouch_mean - slouch_std) + (upright_mean + upright_std)) / 2
+    # threshold = (slouch_mean + upright_mean) / 2
 
     look_down_distances = upright_distances_by_step[LOOK_DOWN_STEP_INDEX]
     if look_down_distances:
         min_nose_neck_distance = statistics.mean(look_down_distances) + statistics.pstdev(look_down_distances)
+        # min_nose_neck_distance = statistics.mean(look_down_distances)
         distance_note = ""
     else:
         min_nose_neck_distance = MIN_NOSE_NECK_DISTANCE_PX
