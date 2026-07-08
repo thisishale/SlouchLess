@@ -41,7 +41,7 @@ MIN_NOSE_NECK_DISTANCE_PX = 35
 NO_PERSON_DISABLE_TIMEOUT_SEC = 30
 MIN_PERSON_PRESENCE_VISIBILITY = 0.6
 
-CALIBRATION_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PostureBooster")
+CALIBRATION_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SlouchLess")
 os.makedirs(CALIBRATION_DIR, exist_ok=True)
 CALIBRATION_FILE = os.path.join(CALIBRATION_DIR, "calibration.json")
 UPRIGHT_STEP_RECORDING_SEC = 5
