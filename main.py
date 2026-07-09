@@ -70,8 +70,8 @@ NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
 SUSTAINED_BAD_POSTURE_SEC = 2
 GOOD_POSTURE_GRACE_SEC = 1
-MIN_NOSE_NECK_DISTANCE_PX = 35
 CVA_ANGLE_ALERT_THRESHOLD_DEG = 85.0
+NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = 60.0
 USE_NECK_VERTEX_ANGLE = True
 NO_PERSON_DISABLE_TIMEOUT_SEC = 30
 MIN_PERSON_PRESENCE_VISIBILITY = 0.6
@@ -79,7 +79,7 @@ MIN_PERSON_PRESENCE_VISIBILITY = 0.6
 CALIBRATION_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SlouchLess")
 os.makedirs(CALIBRATION_DIR, exist_ok=True)
 CALIBRATION_FILE = os.path.join(CALIBRATION_DIR, "calibration.json")
-UPRIGHT_STEP_RECORDING_SEC = 5
+UPRIGHT_STEP_RECORDING_SEC = 10
 SLOUCH_STEP_RECORDING_SEC = 10
 CALIBRATION_WINDOW_NAME = "Posture Calibration"
 CALIBRATION_PREP_COUNTDOWN_SEC = 5
@@ -91,8 +91,8 @@ BAD_POSTURE_MESSAGES = [
     "I would sit right if I were you!",
     "Do you wanna look like a goblin? cool! keep sitting like that!",
     "Your neck is filing a complaint.",
-    "That posture is not giving main character energy.",
-    "Sit up before you turn into a question mark.",
+    "Cringe!",
+    "Wanna turn into a question mark.",
 ]
 
 
@@ -278,21 +278,21 @@ def draw_skeleton(frame, result):
         cv2.line(frame, points[start], points[end], (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def load_calibration_settings(path, default_threshold, default_min_distance, default_cva_threshold):
+def load_calibration_settings(path, default_threshold, default_cva_threshold, default_distance_threshold):
     """
     Loads previously saved calibration values from disk. Each value falls back
     independently to its default if the file is missing, unparsable, or only
     has some of the keys.
     """
     if not os.path.exists(path):
-        return default_threshold, default_min_distance, default_cva_threshold
+        return default_threshold, default_cva_threshold, default_distance_threshold
 
     try:
         with open(path, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         print(f"Could not read calibration file at {path}, using default values.")
-        return default_threshold, default_min_distance, default_cva_threshold
+        return default_threshold, default_cva_threshold, default_distance_threshold
 
     try:
         threshold = float(data["neck_vertex_alert_threshold_deg"])
@@ -300,27 +300,27 @@ def load_calibration_settings(path, default_threshold, default_min_distance, def
         threshold = default_threshold
 
     try:
-        min_distance = float(data["min_nose_neck_distance_px"])
-    except (KeyError, ValueError):
-        min_distance = default_min_distance
-
-    try:
         cva_threshold = float(data["cva_angle_alert_threshold_deg"])
     except (KeyError, ValueError):
         cva_threshold = default_cva_threshold
 
-    return threshold, min_distance, cva_threshold
+    try:
+        distance_threshold = float(data["nose_neck_distance_alert_threshold_px"])
+    except (KeyError, ValueError):
+        distance_threshold = default_distance_threshold
+
+    return threshold, cva_threshold, distance_threshold
 
 
-def save_calibration_settings(path, threshold, min_distance, cva_threshold, debug_stats=None):
+def save_calibration_settings(path, threshold, cva_threshold, distance_threshold, debug_stats=None):
     """
     `debug_stats`, if given, is written under a separate key purely for the
     user's own reference - it's never read back by load_calibration_settings.
     """
     data = {
         "neck_vertex_alert_threshold_deg": threshold,
-        "min_nose_neck_distance_px": min_distance,
         "cva_angle_alert_threshold_deg": cva_threshold,
+        "nose_neck_distance_alert_threshold_px": distance_threshold,
     }
     if debug_stats is not None:
         data["calibration_debug_stats"] = debug_stats
@@ -328,8 +328,8 @@ def save_calibration_settings(path, threshold, min_distance, cva_threshold, debu
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
     print(
-        f"Saved calibrated threshold ({threshold:.1f} deg), min nose-neck distance ({min_distance:.1f} px), "
-        f"and CVA angle threshold ({cva_threshold:.1f} deg) to {path}"
+        f"Saved calibrated threshold ({threshold:.1f} deg), CVA angle threshold ({cva_threshold:.1f} deg), "
+        f"and nose-neck distance threshold ({distance_threshold:.1f} px) to {path}"
     )
 
 
@@ -356,8 +356,8 @@ def ensure_model_downloaded(path, url):
 
 ensure_model_downloaded(MODEL_PATH, MODEL_URL)
 
-NECK_VERTEX_ALERT_THRESHOLD_DEG, MIN_NOSE_NECK_DISTANCE_PX, CVA_ANGLE_ALERT_THRESHOLD_DEG = load_calibration_settings(
-    CALIBRATION_FILE, NECK_VERTEX_ALERT_THRESHOLD_DEG, MIN_NOSE_NECK_DISTANCE_PX, CVA_ANGLE_ALERT_THRESHOLD_DEG
+NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = load_calibration_settings(
+    CALIBRATION_FILE, NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
 )
 
 options = vision.PoseLandmarkerOptions(
@@ -668,11 +668,11 @@ def _run_calibration_countdown(cap, landmarker, calib_window, phase_title, instr
             return False
 
 
-def _run_calibration_recording(cap, landmarker, calib_window, phase_title, instruction, duration_sec, angles, distances, cvas):
+def _run_calibration_recording(cap, landmarker, calib_window, phase_title, instruction, duration_sec, angles, cvas, distances):
     """
     Shows `instruction` as the active step with a countdown in `calib_window`,
-    appending the neck vertex angle, nose-neck distance, and craniovertebral
-    angle of every confidently detected frame to `angles`/`distances`/`cvas`.
+    appending the neck vertex angle, craniovertebral angle, and nose-neck
+    distance of every confidently detected frame to `angles`/`cvas`/`distances`.
     The webcam feed shows only the skeleton, no text. Returns False if
     aborted with 'q', the window was closed, or the camera read failed, True
     once the countdown elapses.
@@ -695,11 +695,11 @@ def _run_calibration_recording(cap, landmarker, calib_window, phase_title, instr
 
             nose = selected["nose"]
             neck = selected["neck"]
-            distances.append(math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"]))
-
             cva_angle = angle_from_horizontal(neck, nose)
             if cva_angle is not None:
                 cvas.append(cva_angle)
+
+            distances.append(math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"]))
 
         cv2.imshow(CALIBRATION_WINDOW_NAME, frame)
 
@@ -720,20 +720,20 @@ def run_calibration_phase(cap, landmarker, calib_window, phase_title, steps, ste
     """
     For each instruction in `steps`: beep and show it with a
     CALIBRATION_PREP_COUNTDOWN_SEC "get ready" countdown (not recorded), then
-    beep again and record the neck vertex angle and nose-neck distance for
-    step_duration_sec seconds. `step_duration_sec` is a required, explicit
-    per-step length rather than a total split across len(steps), so changing
-    how many steps a phase has doesn't silently change each step's length.
+    beep again and record the neck vertex angle, craniovertebral angle, and
+    nose-neck distance for step_duration_sec seconds. `step_duration_sec` is
+    a required, explicit per-step length rather than a total split across
+    len(steps), so changing how many steps a phase has doesn't silently
+    change each step's length.
 
-    Returns (angles_by_step, cvas_by_step, nose_neck_distances_by_step),
-    each a list of per-frame lists in the same order as `steps`. Returns
-    (None, None, None) if any step was aborted with 'q', the window was
-    closed, or no person was ever detected. Reuses the already-open
-    `cap`/`landmarker`.
+    Returns (angles_by_step, cvas_by_step, distances_by_step), each a list of
+    per-frame lists in the same order as `steps`. Returns (None, None, None)
+    if any step was aborted with 'q', the window was closed, or no person
+    was ever detected. Reuses the already-open `cap`/`landmarker`.
     """
     angles_by_step = [[] for _ in steps]
     cvas_by_step = [[] for _ in steps]
-    nose_neck_distances_by_step = [[] for _ in steps]
+    distances_by_step = [[] for _ in steps]
 
     for step_index, instruction in enumerate(steps):
         _play_beep()
@@ -749,25 +749,24 @@ def run_calibration_phase(cap, landmarker, calib_window, phase_title, steps, ste
             instruction,
             step_duration_sec,
             angles_by_step[step_index],
-            nose_neck_distances_by_step[step_index],
             cvas_by_step[step_index],
+            distances_by_step[step_index],
         ):
             return None, None, None
 
     if not any(angles_by_step):
         return None, None, None
 
-    return angles_by_step, cvas_by_step, nose_neck_distances_by_step
+    return angles_by_step, cvas_by_step, distances_by_step
 
 
 LOOK_STRAIGHT_STEP_INDEX = 0
-LOOK_DOWN_STEP_INDEX = 1
 
 
 def run_calibration(cap, landmarker, calib_window):
     """
     Runs a two-phase calibration (good posture, then slouched posture) and
-    returns (threshold, min_nose_neck_distance, cva_threshold_deg, debug_stats),
+    returns (threshold, cva_threshold_deg, distance_threshold_px, debug_stats),
     where debug_stats is a dict of the raw means/stds behind those thresholds
     (for reference only, not read back by load_calibration_settings). Returns
     (None, None, None, None) if either phase was aborted, the window was
@@ -775,11 +774,10 @@ def run_calibration(cap, landmarker, calib_window):
     `calib_window`, never on the console or the webcam feed.
     """
     upright_steps = [
-        "Sit upright, look straight ahead",
-        "Look down slightly (enough to see keyboard and front of you), with upright position",
+        "Please sit upright, look straight ahead",
     ]
     slouch_steps = [
-        "Slouch and slightly move your head left and right",
+        "Please slouch",
     ]
 
     started = calib_window.wait_for_start(
@@ -813,7 +811,7 @@ def run_calibration(cap, landmarker, calib_window):
         return None, None, None, None
 
     calib_window.clear_buttons()
-    slouch_angles_by_step, slouch_cvas_by_step, _ = run_calibration_phase(
+    slouch_angles_by_step, slouch_cvas_by_step, slouch_distances_by_step = run_calibration_phase(
         cap, landmarker, calib_window, "SLOUCHED POSTURE - move naturally", slouch_steps, SLOUCH_STEP_RECORDING_SEC
     )
 
@@ -828,10 +826,7 @@ def run_calibration(cap, landmarker, calib_window):
             calib_window.set_countdown("")
         return None, None, None, None
 
-    # Only the "look straight ahead" step feeds the vertex-angle calibration -
-    # the "look down" step is kept for the nose-neck distance calibration below,
-    # but looking down naturally raises the vertex angle for reasons unrelated
-    # to slouching, which would otherwise skew the upright baseline.
+    # Only the "look straight ahead" step feeds the vertex-angle calibration.
     upright_look_straight_angles = upright_angles_by_step[LOOK_STRAIGHT_STEP_INDEX]
     slouch_all_angles = [a for step_angles in slouch_angles_by_step for a in step_angles]
 
@@ -860,7 +855,7 @@ def run_calibration(cap, landmarker, calib_window):
         upright_cva_std = statistics.pstdev(upright_look_straight_cvas)
         slouch_cva_mean = statistics.mean(slouch_all_cvas)
         slouch_cva_std = statistics.pstdev(slouch_all_cvas)
-        cva_threshold_deg = ((upright_cva_mean - upright_cva_std) + (slouch_cva_mean + slouch_cva_std)) / 2
+        cva_threshold_deg = (upright_cva_mean + slouch_cva_mean) / 2
         cva_note = ""
     else:
         upright_cva_mean = upright_cva_std = None
@@ -868,26 +863,34 @@ def run_calibration(cap, landmarker, calib_window):
         cva_threshold_deg = CVA_ANGLE_ALERT_THRESHOLD_DEG
         cva_note = "\n(Not enough data for CVA - kept current CVA threshold.)"
 
-    look_down_distances = upright_distances_by_step[LOOK_DOWN_STEP_INDEX]
-    if look_down_distances:
-        look_down_distance_mean = statistics.mean(look_down_distances)
-        look_down_distance_std = statistics.pstdev(look_down_distances)
-        min_nose_neck_distance = look_down_distance_mean + look_down_distance_std
+    # Same "look straight ahead" / all-slouch-steps split as CVA above. Nose-neck
+    # distance increases when slouching (same direction as the vertex angle), so
+    # the threshold is the plain midpoint of the two means, matching the CVA formula.
+    upright_look_straight_distances = upright_distances_by_step[LOOK_STRAIGHT_STEP_INDEX]
+    slouch_all_distances = [d for step_distances in slouch_distances_by_step for d in step_distances]
+
+    if upright_look_straight_distances and slouch_all_distances:
+        upright_distance_mean = statistics.mean(upright_look_straight_distances)
+        upright_distance_std = statistics.pstdev(upright_look_straight_distances)
+        slouch_distance_mean = statistics.mean(slouch_all_distances)
+        slouch_distance_std = statistics.pstdev(slouch_all_distances)
+        distance_threshold_px = (upright_distance_mean + slouch_distance_mean) / 2
         distance_note = ""
     else:
-        look_down_distance_mean = look_down_distance_std = None
-        min_nose_neck_distance = MIN_NOSE_NECK_DISTANCE_PX
-        distance_note = "\n(No person detected during 'look down' - kept current min distance.)"
+        upright_distance_mean = upright_distance_std = None
+        slouch_distance_mean = slouch_distance_std = None
+        distance_threshold_px = NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
+        distance_note = "\n(Not enough data for distance - kept current distance threshold.)"
 
     calib_window.set_message(
         "Calibration results:\n\n"
         f"Good posture:  mean={upright_mean:.1f} deg, std={upright_std:.1f} deg\n"
         f"Slouched:      mean={slouch_mean:.1f} deg, std={slouch_std:.1f} deg\n\n"
         f"New alert threshold: {threshold:.1f} deg\n"
-        f"New min nose-neck distance: {min_nose_neck_distance:.1f} px"
-        f"{distance_note}\n"
         f"New craniovertebral angle threshold: {cva_threshold_deg:.1f} deg"
-        f"{cva_note}"
+        f"{cva_note}\n"
+        f"New nose-neck distance threshold: {distance_threshold_px:.1f} px"
+        f"{distance_note}"
     )
     calib_window.set_countdown("")
 
@@ -900,11 +903,13 @@ def run_calibration(cap, landmarker, calib_window):
         "upright_cva_std": upright_cva_std,
         "slouch_cva_mean": slouch_cva_mean,
         "slouch_cva_std": slouch_cva_std,
-        "look_down_distance_mean": look_down_distance_mean,
-        "look_down_distance_std": look_down_distance_std,
+        "upright_distance_mean": upright_distance_mean,
+        "upright_distance_std": upright_distance_std,
+        "slouch_distance_mean": slouch_distance_mean,
+        "slouch_distance_std": slouch_distance_std,
     }
 
-    return threshold, min_nose_neck_distance, cva_threshold_deg, debug_stats
+    return threshold, cva_threshold_deg, distance_threshold_px, debug_stats
 
 with vision.PoseLandmarker.create_from_options(options) as landmarker:
     calib_window = CalibrationWindow()
@@ -919,21 +924,21 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
             "Would you like to calibrate posture thresholds for this session?"
         )
         if calibrate_choice and check_volume_and_warn(calib_window):
-            calibrated_threshold, calibrated_min_distance, calibrated_cva_threshold, calibration_debug_stats = run_calibration(
+            calibrated_threshold, calibrated_cva_threshold, calibrated_distance_threshold, calibration_debug_stats = run_calibration(
                 cap, landmarker, calib_window
             )
             if calibrated_threshold is not None:
                 NECK_VERTEX_ALERT_THRESHOLD_DEG = calibrated_threshold
-                MIN_NOSE_NECK_DISTANCE_PX = calibrated_min_distance
                 CVA_ANGLE_ALERT_THRESHOLD_DEG = calibrated_cva_threshold
+                NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = calibrated_distance_threshold
                 if not calib_window.closed:
                     save_choice = calib_window.ask_yes_no("Save these as your permanent posture settings?")
                     if save_choice:
                         save_calibration_settings(
                             CALIBRATION_FILE,
                             calibrated_threshold,
-                            calibrated_min_distance,
                             calibrated_cva_threshold,
+                            calibrated_distance_threshold,
                             calibration_debug_stats,
                         )
     finally:
@@ -995,8 +1000,6 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
             nose_neck_distance = math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"])
 
             is_bad_posture_frame = monitoring_enabled and (
-                nose_neck_distance >= MIN_NOSE_NECK_DISTANCE_PX
-            ) and (
                 (
                     USE_NECK_VERTEX_ANGLE
                     and vertex_angle is not None
@@ -1006,6 +1009,7 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
                     not USE_NECK_VERTEX_ANGLE
                     and cva_angle is not None
                     and cva_angle < CVA_ANGLE_ALERT_THRESHOLD_DEG
+                    and nose_neck_distance >= NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
                 )
             )
 
