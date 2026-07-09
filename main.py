@@ -16,6 +16,7 @@ import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 from pycaw.pycaw import AudioUtilities
+from pygrabber.dshow_graph import FilterGraph
 
 
 def resource_path(*parts):
@@ -366,11 +367,64 @@ options = vision.PoseLandmarkerOptions(
     min_tracking_confidence=0.5,
 )
 
-# Try 0 first. If you have multiple cameras, try 1 or 2.
-cap = cv2.VideoCapture(1)
+
+def list_camera_names():
+    """
+    Returns detected camera friendly names in the same order DirectShow
+    assigns indices, so camera_names[i] corresponds to VideoCapture(i,
+    cv2.CAP_DSHOW). Returns [] if enumeration fails for any reason.
+    """
+    try:
+        return FilterGraph().get_input_devices()
+    except Exception:
+        return []
+
+
+def prompt_for_camera(camera_names):
+    """
+    Shows a window listing detected camera names as buttons and blocks until
+    one is clicked. Returns the chosen index, or 0 if the window is closed
+    without a selection.
+    """
+    root = tk.Tk()
+    root.title("SlouchLess - Select Camera")
+    root.attributes("-topmost", True)
+
+    try:
+        icon_image = tk.PhotoImage(file=CALIBRATION_ICON_PATH)
+        root.iconphoto(True, icon_image)
+    except tk.TclError:
+        pass
+
+    chosen = {"index": 0}
+
+    def choose(index):
+        chosen["index"] = index
+        root.destroy()
+
+    tk.Label(root, text="Select which camera to use:", font=("Segoe UI", 12)).pack(padx=20, pady=(20, 10))
+    for index, name in enumerate(camera_names):
+        tk.Button(root, text=name, width=30, command=lambda i=index: choose(i)).pack(padx=20, pady=4)
+    tk.Frame(root, height=10).pack()
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.update_idletasks()
+    width = root.winfo_reqwidth()
+    height = root.winfo_reqheight()
+    x = (root.winfo_screenwidth() - width) // 2
+    y = (root.winfo_screenheight() - height) // 2
+    root.geometry(f"{width}x{height}+{x}+{y}")
+
+    root.mainloop()
+    return chosen["index"]
+
+
+camera_names = list_camera_names()
+camera_index = prompt_for_camera(camera_names) if camera_names else 0
+cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 
 if not cap.isOpened():
-    raise RuntimeError("Could not open webcam. Try changing VideoCapture(0) to VideoCapture(1).")
+    raise RuntimeError("Could not open the selected webcam.")
 
 last_print_time = time.time()
 last_posture_alert_time = 0.0
