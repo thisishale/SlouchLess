@@ -1,22 +1,65 @@
 import ctypes
+import glob
 import json
 import math
 import os
+import platform
 import random
+import re
 import statistics
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 import urllib.request
-import winsound
+from tkinter import messagebox
 
 import cv2
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
-from pycaw.pycaw import AudioUtilities
-from pygrabber.dshow_graph import FilterGraph
+
+IS_WINDOWS = platform.system() == "Windows"
+
+if IS_WINDOWS:
+    import winsound
+    from pycaw.pycaw import AudioUtilities
+    from pygrabber.dshow_graph import FilterGraph
+
+
+def _show_fatal_error(error_text):
+    """
+    Shows `error_text` in a Tkinter error dialog. The app is built with
+    console=False, so an uncaught exception's traceback would otherwise just
+    vanish - there's no terminal attached to print it to when launched by
+    double-clicking the executable.
+    """
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("SlouchLess - Fatal Error", error_text)
+        root.destroy()
+    except Exception:
+        pass  # if Tk itself is broken, there's nothing left to show it with
+
+
+def _handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    error_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(error_text, file=sys.stderr)
+    _show_fatal_error(error_text)
+
+
+def _handle_uncaught_thread_exception(args):
+    _handle_uncaught_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+
+sys.excepthook = _handle_uncaught_exception
+threading.excepthook = _handle_uncaught_thread_exception
 
 
 def resource_path(*parts):
@@ -76,7 +119,10 @@ USE_NECK_VERTEX_ANGLE = True
 NO_PERSON_DISABLE_TIMEOUT_SEC = 30
 MIN_PERSON_PRESENCE_VISIBILITY = 0.6
 
-CALIBRATION_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SlouchLess")
+if IS_WINDOWS:
+    CALIBRATION_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SlouchLess")
+else:
+    CALIBRATION_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "SlouchLess")
 os.makedirs(CALIBRATION_DIR, exist_ok=True)
 CALIBRATION_FILE = os.path.join(CALIBRATION_DIR, "calibration.json")
 UPRIGHT_STEP_RECORDING_SEC = 10
@@ -96,6 +142,27 @@ BAD_POSTURE_MESSAGES = [
 ]
 
 
+def _get_linux_volume_state():
+    """
+    Reads the default sink's mute/volume state via `pactl` (PulseAudio/
+    PipeWire's CLI, present on virtually all Linux desktops). Raises on any
+    unexpected output/missing binary - the caller treats that as "can't tell,
+    don't warn", same as a Windows pycaw failure.
+    """
+    mute_output = subprocess.run(
+        ["pactl", "get-sink-mute", "@DEFAULT_SINK@"], capture_output=True, text=True, timeout=2, check=True
+    ).stdout
+    is_muted = "yes" in mute_output.lower()
+
+    volume_output = subprocess.run(
+        ["pactl", "get-sink-volume", "@DEFAULT_SINK@"], capture_output=True, text=True, timeout=2, check=True
+    ).stdout
+    match = re.search(r"(\d+)%", volume_output)
+    volume_level = int(match.group(1)) / 100
+
+    return is_muted, volume_level
+
+
 def check_volume_and_warn(calib_window, mute_threshold=LOW_VOLUME_THRESHOLD):
     """
     Warns the user via `calib_window` if system audio is muted or very quiet,
@@ -108,9 +175,12 @@ def check_volume_and_warn(calib_window, mute_threshold=LOW_VOLUME_THRESHOLD):
     so the caller can abort calibration; True otherwise.
     """
     try:
-        volume = AudioUtilities.GetSpeakers().EndpointVolume
-        is_muted = bool(volume.GetMute())
-        volume_level = volume.GetMasterVolumeLevelScalar()
+        if IS_WINDOWS:
+            volume = AudioUtilities.GetSpeakers().EndpointVolume
+            is_muted = bool(volume.GetMute())
+            volume_level = volume.GetMasterVolumeLevelScalar()
+        else:
+            is_muted, volume_level = _get_linux_volume_state()
     except Exception:
         return True
 
@@ -368,23 +438,74 @@ options = vision.PoseLandmarkerOptions(
 )
 
 
+def _v4l2_supports_capture(device_path):
+    """
+    Queries whether `device_path` is an actual video capture node via the
+    VIDIOC_QUERYCAP ioctl. Some UVC webcams expose a second, metadata-only
+    /dev/videoN node right next to their real capture node, sharing the same
+    sysfs name - this filters those out of the camera picker so the same
+    camera doesn't show up twice. Returns True on any failure to query, so a
+    device that can't be inspected still shows up rather than silently
+    disappearing.
+    """
+    import fcntl
+    import struct
+
+    V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+    V4L2_CAP_DEVICE_CAPS = 0x80000000
+    VIDIOC_QUERYCAP = 0x80685600
+
+    try:
+        with open(device_path, "rb") as f:
+            buf = bytearray(104)  # sizeof(struct v4l2_capability)
+            fcntl.ioctl(f.fileno(), VIDIOC_QUERYCAP, buf, True)
+            capabilities, device_caps = struct.unpack_from("=II", buf, 84)
+            if capabilities & V4L2_CAP_DEVICE_CAPS:
+                capabilities = device_caps
+            return bool(capabilities & V4L2_CAP_VIDEO_CAPTURE)
+    except OSError:
+        return True
+
+
 def list_camera_names():
     """
-    Returns detected camera friendly names in the same order DirectShow
-    assigns indices, so camera_names[i] corresponds to VideoCapture(i,
-    cv2.CAP_DSHOW). Returns [] if enumeration fails for any reason.
+    Returns detected cameras as (index, name) pairs, where `index` is the
+    value to pass to cv2.VideoCapture. On Windows this matches DirectShow's
+    enumeration order. On Linux it's read directly from each /dev/videoN
+    node's sysfs entry instead of assumed to be contiguous, filtering out
+    non-capture nodes via _v4l2_supports_capture - a physical webcam commonly
+    exposes a second, metadata-only node right next to its real one sharing
+    the same name, and position-in-list can't be trusted to equal the device
+    index the way it can on Windows. Returns [] if enumeration fails entirely.
     """
-    try:
-        return FilterGraph().get_input_devices()
-    except Exception:
-        return []
+    if IS_WINDOWS:
+        try:
+            return list(enumerate(FilterGraph().get_input_devices()))
+        except Exception:
+            return []
+
+    cameras = []
+    for device_path in sorted(glob.glob("/dev/video*")):
+        try:
+            index = int(device_path.removeprefix("/dev/video"))
+        except ValueError:
+            continue
+        if not _v4l2_supports_capture(device_path):
+            continue
+        try:
+            with open(f"/sys/class/video4linux/video{index}/name", "r") as f:
+                name = f.read().strip()
+        except OSError:
+            name = f"Camera {index}"
+        cameras.append((index, name))
+    return cameras
 
 
-def prompt_for_camera(camera_names):
+def prompt_for_camera(cameras):
     """
     Shows a window listing detected camera names as buttons and blocks until
-    one is clicked. Returns the chosen index, or 0 if the window is closed
-    without a selection.
+    one is clicked. Returns the chosen device index, or None if the window
+    was closed without a selection.
     """
     root = tk.Tk()
     root.title("SlouchLess - Select Camera")
@@ -396,14 +517,14 @@ def prompt_for_camera(camera_names):
     except tk.TclError:
         pass
 
-    chosen = {"index": 0}
+    chosen = {"index": None}
 
     def choose(index):
         chosen["index"] = index
         root.destroy()
 
     tk.Label(root, text="Select which camera to use:", font=("Segoe UI", 12)).pack(padx=20, pady=(20, 10))
-    for index, name in enumerate(camera_names):
+    for index, name in cameras:
         tk.Button(root, text=name, width=30, command=lambda i=index: choose(i)).pack(padx=20, pady=4)
     tk.Frame(root, height=10).pack()
 
@@ -419,9 +540,16 @@ def prompt_for_camera(camera_names):
     return chosen["index"]
 
 
-camera_names = list_camera_names()
-camera_index = prompt_for_camera(camera_names) if camera_names else 0
-cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+cameras = list_camera_names()
+if not cameras:
+    messagebox.showerror("SlouchLess", "No camera was detected. The app will now close.")
+    sys.exit(1)
+
+camera_index = prompt_for_camera(cameras)
+if camera_index is None:
+    sys.exit(0)
+
+cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_V4L2)
 
 if not cap.isOpened():
     raise RuntimeError("Could not open the selected webcam.")
@@ -507,10 +635,12 @@ class CalibrationWindow:
 
         self._response = None
         self.closed = False
+        self.closed_by_user = False
         self._destroyed = False
 
     def _on_close(self):
         self._response = False
+        self.closed_by_user = True
         self.close()
 
     def pump(self):
@@ -608,8 +738,17 @@ class CalibrationWindow:
             pass
 
 
-def _play_beep():
-    winsound.Beep(BEEP_FREQUENCY_HZ, BEEP_DURATION_MS)
+def _play_beep(calib_window):
+    if IS_WINDOWS:
+        winsound.Beep(BEEP_FREQUENCY_HZ, BEEP_DURATION_MS)
+        return
+
+    # winsound.Beep has no non-Windows equivalent. Tk's bell() rings the
+    # system bell (XBell on X11) with zero extra dependencies beyond Tk
+    # itself, which the app already bundles for its UI - unlike shelling out
+    # to an audio library, nothing extra needs to be installed on the end
+    # user's machine.
+    calib_window.root.bell()
 
 
 def _read_and_detect(cap, landmarker):
@@ -736,11 +875,11 @@ def run_calibration_phase(cap, landmarker, calib_window, phase_title, steps, ste
     distances_by_step = [[] for _ in steps]
 
     for step_index, instruction in enumerate(steps):
-        _play_beep()
+        _play_beep(calib_window)
         if not _run_calibration_countdown(cap, landmarker, calib_window, phase_title, instruction, CALIBRATION_PREP_COUNTDOWN_SEC):
             return None, None, None
 
-        _play_beep()
+        _play_beep(calib_window)
         if not _run_calibration_recording(
             cap,
             landmarker,
@@ -944,6 +1083,9 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
     finally:
         calib_window.close()
 
+    if calib_window.closed_by_user:
+        sys.exit(0)
+
     cv2.namedWindow(VIDEO_WINDOW_NAME, cv2.WINDOW_NORMAL)
     set_window_icon(VIDEO_WINDOW_NAME, APP_ICON_PATH)
 
@@ -1095,7 +1237,15 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-        if cv2.getWindowProperty(VIDEO_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+        # Closing the window via the OS close button can fully tear down the
+        # underlying window immediately on some backends (observed with
+        # OpenCV's Qt backend on Linux), so querying a now-gone window raises
+        # cv2.error instead of just reporting it as not visible the way the
+        # GTK/Win32 backends do. Either outcome means the same thing here.
+        try:
+            if cv2.getWindowProperty(VIDEO_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except cv2.error:
             break
 
 cap.release()
