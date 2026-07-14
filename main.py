@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 import glob
 import json
@@ -13,13 +14,10 @@ import threading
 import time
 import tkinter as tk
 import traceback
-import urllib.request
 from tkinter import messagebox
 
 import cv2
-import mediapipe as mp
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.core.base_options import BaseOptions
+from rtmlib import Body
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -100,11 +98,6 @@ def set_window_icon(window_title, icon_path):
         pass
 
 
-MODEL_PATH = resource_path("pose_landmarker_lite.task")
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
-)
 CALIBRATION_ICON_PATH = resource_path("images", "SlouchImageopt.png")
 APP_ICON_PATH = resource_path("images", "SlouchLess.ico")
 VIDEO_WINDOW_NAME = "SlouchLess"
@@ -197,96 +190,98 @@ def check_volume_and_warn(calib_window, mute_threshold=LOW_VOLUME_THRESHOLD):
     return calib_window.wait_for_start(message, button_text="OK")
 
 
-PoseLandmark = vision.PoseLandmark
-POSE_CONNECTIONS = [(c.start, c.end) for c in vision.PoseLandmarksConnections.POSE_LANDMARKS]
+# RTMPose (via rtmlib's Body class) reports the standard COCO-17 keypoint
+# layout: 0 nose, 1 left_eye, 2 right_eye, 3 left_ear, 4 right_ear,
+# 5 left_shoulder, 6 right_shoulder, 7-16 elbows/wrists/hips/knees/ankles.
+COCO17_NOSE = 0
+COCO17_LEFT_EYE = 1
+COCO17_RIGHT_EYE = 2
+COCO17_LEFT_EAR = 3
+COCO17_RIGHT_EAR = 4
+COCO17_LEFT_SHOULDER = 5
+COCO17_RIGHT_SHOULDER = 6
+
+POSE_CONNECTIONS = [
+    (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6), (5, 6),
+    (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16),
+]
 
 # Useful landmarks for posture
 POSTURE_LANDMARKS = {
-    "nose": PoseLandmark.NOSE,
-    "left_ear": PoseLandmark.LEFT_EAR,
-    "right_ear": PoseLandmark.RIGHT_EAR,
-    "left_shoulder": PoseLandmark.LEFT_SHOULDER,
-    "right_shoulder": PoseLandmark.RIGHT_SHOULDER,
+    "nose": COCO17_NOSE,
+    "left_ear": COCO17_LEFT_EAR,
+    "right_ear": COCO17_RIGHT_EAR,
+    "left_shoulder": COCO17_LEFT_SHOULDER,
+    "right_shoulder": COCO17_RIGHT_SHOULDER,
 }
 
 
-def extract_landmarks(result, frame_width, frame_height):
+def extract_landmarks(keypoints, scores):
     """
-    Returns selected landmarks in both normalized and pixel coordinates.
-    x, y are normalized from 0 to 1.
-    px, py are actual image pixel coordinates.
-    z is relative depth from MediaPipe.
-    visibility is confidence-like visibility score.
+    Returns selected landmarks in pixel coordinates. RTMPose already reports
+    keypoints in pixel space (unlike MediaPipe's normalized 0-1 landmarks),
+    so no frame-dimension scaling is needed here.
+    px, py are image pixel coordinates.
+    visibility is RTMPose's per-keypoint confidence score.
     """
-    if not result.pose_landmarks:
+    if len(keypoints) == 0:
         return None
 
-    landmarks = result.pose_landmarks[0]
+    person_kpts = keypoints[0]
+    person_scores = scores[0]
     extracted = {}
 
-    for name, landmark_enum in POSTURE_LANDMARKS.items():
-        lm = landmarks[landmark_enum.value]
-
+    for name, idx in POSTURE_LANDMARKS.items():
+        px, py = person_kpts[idx]
         extracted[name] = {
-            "x": lm.x,
-            "y": lm.y,
-            "z": lm.z,
-            "visibility": lm.visibility,
-            "px": int(lm.x * frame_width),
-            "py": int(lm.y * frame_height),
+            "px": int(px),
+            "py": int(py),
+            "visibility": float(person_scores[idx]),
         }
 
-    extracted["neck"] = _estimate_neck(landmarks, frame_width, frame_height)
+    extracted["neck"] = _estimate_neck(person_kpts, person_scores)
 
     return extracted
 
 
-def _estimate_neck(landmarks, frame_width, frame_height):
+def _estimate_neck(person_kpts, person_scores):
     """
-    Neck isn't a native MediaPipe landmark. Estimate it as the visibility-weighted
-    average of both shoulders and both eyes, so an occluded/low-confidence shoulder
-    doesn't drag the estimate off to one side.
+    Neck isn't a native pose-model landmark. Estimate it as the
+    visibility-weighted average of both shoulders and both eyes, so an
+    occluded/low-confidence shoulder doesn't drag the estimate off to one side.
     """
-    NECK_SOURCE_LANDMARKS = (
-        PoseLandmark.LEFT_SHOULDER,
-        PoseLandmark.RIGHT_SHOULDER,
-        PoseLandmark.LEFT_EYE,
-        PoseLandmark.RIGHT_EYE,
-    )
+    NECK_SOURCE_INDICES = (COCO17_LEFT_SHOULDER, COCO17_RIGHT_SHOULDER, COCO17_LEFT_EYE, COCO17_RIGHT_EYE)
 
-    sources = [landmarks[lm.value] for lm in NECK_SOURCE_LANDMARKS]
-    total_weight = sum(lm.visibility for lm in sources)
+    source_points = [person_kpts[i] for i in NECK_SOURCE_INDICES]
+    source_scores = [person_scores[i] for i in NECK_SOURCE_INDICES]
+    total_weight = sum(source_scores)
 
     if total_weight <= 0:
         # Fall back to an unweighted average if visibility scores are unusable.
-        weights = [1.0] * len(sources)
-        total_weight = float(len(sources))
+        weights = [1.0] * len(source_points)
+        total_weight = float(len(source_points))
     else:
-        weights = [lm.visibility for lm in sources]
+        weights = source_scores
 
-    neck_x = sum(lm.x * w for lm, w in zip(sources, weights)) / total_weight
-    neck_y = sum(lm.y * w for lm, w in zip(sources, weights)) / total_weight
-    neck_z = sum(lm.z * w for lm, w in zip(sources, weights)) / total_weight
-    neck_visibility = sum(lm.visibility for lm in sources) / len(sources)
+    neck_px = sum(pt[0] * w for pt, w in zip(source_points, weights)) / total_weight
+    neck_py = sum(pt[1] * w for pt, w in zip(source_points, weights)) / total_weight
+    neck_visibility = sum(source_scores) / len(source_scores)
 
     return {
-        "x": neck_x,
-        "y": neck_y,
-        "z": neck_z,
+        "px": int(neck_px),
+        "py": int(neck_py),
         "visibility": neck_visibility,
-        "px": int(neck_x * frame_width),
-        "py": int(neck_y * frame_height),
     }
 
 
 def is_person_present(selected):
     """
-    In VIDEO mode MediaPipe tracks the previous detection instead of re-running
-    full detection every frame, so it can lock onto a static background object
-    (a chair, a coat on a hook) and keep reporting it as a person indefinitely.
-    Requiring decent visibility on the core landmarks filters most of those out,
-    since a real person's shoulders/nose are confidently visible while a
-    misidentified object's landmarks tend to be low-confidence guesses.
+    The person detector occasionally produces a low-confidence detection on a
+    non-person object (a chair, a coat on a hook). Requiring decent visibility
+    on the core landmarks filters most of those out, since a real person's
+    shoulders/nose are confidently detected while a misidentified object's
+    keypoints tend to be low-confidence guesses.
     """
     if selected is None:
         return False
@@ -336,16 +331,19 @@ def angle_from_horizontal(point_a, point_b):
     return math.degrees(math.atan2(abs(dy), abs(dx)))
 
 
-def draw_skeleton(frame, result):
-    if not result.pose_landmarks:
+def draw_skeleton(frame, keypoints, scores, kpt_thr=0.3):
+    if len(keypoints) == 0:
         return
 
-    landmarks = result.pose_landmarks[0]
-    h, w = frame.shape[:2]
-    points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    person_kpts = keypoints[0]
+    person_scores = scores[0]
 
     for start, end in POSE_CONNECTIONS:
-        cv2.line(frame, points[start], points[end], (255, 255, 255), 1, cv2.LINE_AA)
+        if person_scores[start] < kpt_thr or person_scores[end] < kpt_thr:
+            continue
+        pt1 = (int(person_kpts[start][0]), int(person_kpts[start][1]))
+        pt2 = (int(person_kpts[end][0]), int(person_kpts[end][1]))
+        cv2.line(frame, pt1, pt2, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def load_calibration_settings(path, default_threshold, default_cva_threshold, default_distance_threshold):
@@ -403,38 +401,8 @@ def save_calibration_settings(path, threshold, cva_threshold, distance_threshold
     )
 
 
-def ensure_model_downloaded(path, url):
-    """
-    Downloads the MediaPipe model file if it isn't already present locally.
-    Streams to a .part file first and renames on success, so an interrupted
-    download can't leave a corrupt model file at the real path.
-    """
-    if os.path.exists(path):
-        return
-
-    print(f"Model not found at {path}, downloading from {url} ...")
-    tmp_path = path + ".part"
-    try:
-        urllib.request.urlretrieve(url, tmp_path)
-        os.replace(tmp_path, path)
-        print("Model download complete.")
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
-
-
-ensure_model_downloaded(MODEL_PATH, MODEL_URL)
-
 NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = load_calibration_settings(
     CALIBRATION_FILE, NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
-)
-
-options = vision.PoseLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=vision.RunningMode.VIDEO,
-    min_pose_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
 )
 
 
@@ -761,15 +729,10 @@ def _read_and_detect(cap, landmarker):
     if not ret:
         return None, None
 
-    frame_width = frame.shape[1]
-    frame_height = frame.shape[0]
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-    timestamp_ms = int(time.time() * 1000)
-    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+    keypoints, scores = landmarker(frame)
 
-    draw_skeleton(frame, result)
-    selected = extract_landmarks(result, frame_width, frame_height)
+    draw_skeleton(frame, keypoints, scores)
+    selected = extract_landmarks(keypoints, scores)
 
     return frame, selected
 
@@ -1050,7 +1013,12 @@ def run_calibration(cap, landmarker, calib_window):
 
     return threshold, cva_threshold_deg, distance_threshold_px, debug_stats
 
-with vision.PoseLandmarker.create_from_options(options) as landmarker:
+pose_estimator = Body(mode="lightweight", backend="onnxruntime", device="cpu")
+
+# rtmlib's Body has no context-manager protocol (no cleanup needed, unlike
+# MediaPipe's PoseLandmarker), so this just passes it through unchanged -
+# kept as a `with` purely to avoid re-indenting the rest of the file.
+with contextlib.nullcontext(pose_estimator) as landmarker:
     calib_window = CalibrationWindow()
     try:
         USE_NECK_VERTEX_ANGLE = calib_window.ask_yes_no(
@@ -1096,19 +1064,14 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
             print("Could not read frame.")
             break
 
-        frame_height, frame_width = frame.shape[:2]
+        frame_height = frame.shape[0]
 
-        # OpenCV uses BGR. MediaPipe expects RGB.
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
-        timestamp_ms = int(time.time() * 1000)
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        keypoints, scores = landmarker(frame)
 
         # Draw full pose skeleton on the frame
-        draw_skeleton(frame, result)
+        draw_skeleton(frame, keypoints, scores)
 
-        selected = extract_landmarks(result, frame_width, frame_height)
+        selected = extract_landmarks(keypoints, scores)
 
         if is_person_present(selected):
             last_person_seen_time = time.time()
@@ -1211,7 +1174,6 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
                 for name, data in selected.items():
                     print(
                         f"{name:15s} "
-                        f"x={data['x']:.3f}, y={data['y']:.3f}, z={data['z']:.3f}, "
                         f"px={data['px']:4d}, py={data['py']:4d}, "
                         f"visibility={data['visibility']:.2f}"
                     )
