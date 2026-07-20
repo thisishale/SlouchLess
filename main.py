@@ -108,6 +108,10 @@ MODEL_TYPE_LABELS = {
     "svm_rbf": "SVM (RBF kernel)",
     "random_forest": "Random Forest",
 }
+# ask_choice() returns the chosen key verbatim, so this needs to be a value
+# that can never collide with an entry in MODEL_TYPE_LABELS.
+THRESHOLDS_CHOICE_KEY = "__calibrated_thresholds__"
+SWITCH_MODEL_BUTTON_LABEL = "Switch Model"
 VIDEO_WINDOW_NAME = "SlouchLess"
 # default is 123.
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
@@ -524,6 +528,30 @@ def discover_available_models(position):
         if os.path.exists(model_file):
             available[model_name] = model_file
     return available
+
+
+def prompt_model_switch(available_models):
+    """
+    Opens a short-lived picker dialog - the same style shown at startup - so
+    the model driving live inference can be changed mid-session from the
+    "Switch Model" button on the video window, without restarting the app.
+    Returns (model_name, slouch_model) for the user's pick, or None if they
+    closed the dialog without choosing anything.
+    """
+    choices = [(name, MODEL_TYPE_LABELS.get(name, name)) for name in MODEL_TYPE_LABELS if name in available_models]
+    choices.append((THRESHOLDS_CHOICE_KEY, "Calibrated thresholds"))
+
+    picker = CalibrationWindow()
+    try:
+        chosen = picker.ask_choice("Select which trained model to use:", choices)
+    finally:
+        picker.close()
+
+    if chosen is None:
+        return None
+    if chosen == THRESHOLDS_CHOICE_KEY:
+        return (None, None)
+    return (chosen, load_slouch_model(available_models[chosen]))
 
 
 def _v4l2_supports_capture(device_path):
@@ -1174,6 +1202,7 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
         available_models = discover_available_models(position)
 
         slouch_model_path = None
+        chosen_model_name = None
         if available_models and not calib_window.closed:
             chosen_model_name = calib_window.ask_choice(
                 "Select which trained model to use:",
@@ -1184,7 +1213,9 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
         if slouch_model_path is None:
             slouch_model_path = resolve_slouch_model_path(is_camera_above)
+            chosen_model_name = None  # legacy fallback path isn't one of the fixed MODEL_TYPE_LABELS entries
         slouch_model = load_slouch_model(slouch_model_path)
+        current_model_name = chosen_model_name if slouch_model is not None else None
 
         if slouch_model is not None:
             print(f"Loaded trained slouch model from {slouch_model_path}; skipping threshold calibration.")
@@ -1218,6 +1249,23 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
     cv2.namedWindow(VIDEO_WINDOW_NAME, cv2.WINDOW_NORMAL)
     set_window_icon(VIDEO_WINDOW_NAME, APP_ICON_PATH)
+
+    # Hit-box for the "Switch Model" button, recomputed each frame (drawn
+    # top-right, sized to the frame's current width) so on_video_mouse always
+    # tests clicks against where the button was actually drawn. Only clickable
+    # when there's more than one trained model type to switch between.
+    switch_model_button = {"x1": 0, "y1": 0, "x2": 0, "y2": 0, "visible": False, "clicked": False}
+
+    def on_video_mouse(event, x, y, flags, userdata):
+        if (
+            event == cv2.EVENT_LBUTTONDOWN
+            and switch_model_button["visible"]
+            and switch_model_button["x1"] <= x <= switch_model_button["x2"]
+            and switch_model_button["y1"] <= y <= switch_model_button["y2"]
+        ):
+            switch_model_button["clicked"] = True
+
+    cv2.setMouseCallback(VIDEO_WINDOW_NAME, on_video_mouse)
 
     while True:
         ret, frame = cap.read()
@@ -1317,7 +1365,11 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
             # Show all angles stacked in the top-left corner
             overlay_lines = []
-            overlay_lines.append(f"posture detection: {'ML model' if slouch_model is not None else 'calibrated thresholds'}")
+            if slouch_model is not None:
+                model_label = MODEL_TYPE_LABELS.get(current_model_name, current_model_name or "unknown")
+                overlay_lines.append(f"posture detection: ML model ({model_label})")
+            else:
+                overlay_lines.append("posture detection: calibrated thresholds")
             if vertex_angle is not None:
                 overlay_lines.append(f"neck vertex angle: {vertex_angle:.1f} deg")
             if left_angle is not None:
@@ -1357,7 +1409,42 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
                 cv2.LINE_AA,
             )
 
+        if available_models:
+            pad_x, pad_y = 10, 8
+            (text_w, text_h), _ = cv2.getTextSize(SWITCH_MODEL_BUTTON_LABEL, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            x2 = frame.shape[1] - 10
+            x1 = x2 - text_w - 2 * pad_x
+            y1 = 10
+            y2 = y1 + text_h + 2 * pad_y
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 60, 60), -1)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (220, 220, 220), 1)
+            cv2.putText(
+                frame,
+                SWITCH_MODEL_BUTTON_LABEL,
+                (x1 + pad_x, y2 - pad_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            switch_model_button.update(x1=x1, y1=y1, x2=x2, y2=y2, visible=True)
+        else:
+            switch_model_button["visible"] = False
+
         cv2.imshow(VIDEO_WINDOW_NAME, frame)
+
+        if switch_model_button["clicked"]:
+            switch_model_button["clicked"] = False
+            result = prompt_model_switch(available_models)
+            if result is not None:
+                current_model_name, slouch_model = result
+                bad_posture_since = None
+                good_posture_since = None
+                if slouch_model is not None:
+                    print(f"Switched posture detection to {MODEL_TYPE_LABELS.get(current_model_name, current_model_name)} model.")
+                else:
+                    print("Switched posture detection to calibrated thresholds.")
 
         # Press q to quit
         if cv2.waitKey(1) & 0xFF == ord("q"):
