@@ -530,22 +530,33 @@ def discover_available_models(position):
     return available
 
 
-def prompt_model_switch(available_models):
+def prompt_model_switch(calib_window, available_models):
     """
-    Opens a short-lived picker dialog - the same style shown at startup - so
-    the model driving live inference can be changed mid-session from the
-    "Switch Model" button on the video window, without restarting the app.
-    Returns (model_name, slouch_model) for the user's pick, or None if they
-    closed the dialog without choosing anything.
+    Reopens the shared calibration root (hidden, not destroyed, since the
+    startup dialogs finished) to let the model driving live inference be
+    changed mid-session from the "Switch Model" button on the video window.
+    Reuses that one root rather than creating a second Tk() - Tcl only
+    tolerates one live root/thread at a time, and a second one here would
+    race it exactly the way alert_bad_posture's old threaded popup did (see
+    its docstring). Returns (model_name, slouch_model) for the user's pick,
+    or None if there was nothing to apply (dialog closed without choosing,
+    or the window was destroyed because the user closed it via its own
+    window-manager close button - in which case it can't be reopened again
+    for the rest of the session).
     """
+    if calib_window.closed:
+        print("Calibration window is no longer available; can't switch models.")
+        return None
+
     choices = [(name, MODEL_TYPE_LABELS.get(name, name)) for name in MODEL_TYPE_LABELS if name in available_models]
     choices.append((THRESHOLDS_CHOICE_KEY, "Calibrated thresholds"))
 
-    picker = CalibrationWindow()
+    calib_window.reopen()
     try:
-        chosen = picker.ask_choice("Select which trained model to use:", choices)
+        chosen = calib_window.ask_choice("Select which trained model to use:", choices)
     finally:
-        picker.close()
+        if not calib_window.closed:
+            calib_window.hide()
 
     if chosen is None:
         return None
@@ -678,15 +689,27 @@ bad_posture_since = None
 good_posture_since = None
 
 
-def _show_posture_popup(message):
-    root = tk.Tk()
-    root.title("Posture Alert")
-    root.attributes("-topmost", True)
-    root.overrideredirect(True)
-    root.configure(bg="#1e1e1e")
+def _show_posture_popup(calib_window, message):
+    """
+    Shows a transient "you're slouching" toast as a Toplevel on the shared
+    calibration root, rather than spawning its own thread + Tk() root. Tcl
+    only tolerates being touched from one thread at a time - a second root
+    from a background thread here can race the shared root's own dialogs
+    (e.g. the switch-model picker) and crash with
+    "Tcl_AsyncDelete: async handler deleted by the wrong thread". Nothing
+    here runs its own mainloop(); the popup only actually renders and
+    auto-dismisses via the main loop's regular calib_window.pump() calls.
+    """
+    if calib_window.closed:
+        return
+
+    popup = tk.Toplevel(calib_window.root)
+    popup.attributes("-topmost", True)
+    popup.overrideredirect(True)
+    popup.configure(bg="#1e1e1e")
 
     label = tk.Label(
-        root,
+        popup,
         text=message,
         wraplength=380,
         fg="white",
@@ -699,20 +722,19 @@ def _show_posture_popup(message):
     # Size the window to fit the message instead of a fixed geometry, so a
     # longer BAD_POSTURE_MESSAGES entry that wraps to more lines doesn't get
     # clipped by a too-short fixed height.
-    root.update_idletasks()
-    width = root.winfo_reqwidth()
-    height = root.winfo_reqheight()
-    x = (root.winfo_screenwidth() - width) // 2
-    y = (root.winfo_screenheight() - height) // 2
-    root.geometry(f"{width}x{height}+{x}+{y}")
+    popup.update_idletasks()
+    width = popup.winfo_reqwidth()
+    height = popup.winfo_reqheight()
+    x = (popup.winfo_screenwidth() - width) // 2
+    y = (popup.winfo_screenheight() - height) // 2
+    popup.geometry(f"{width}x{height}+{x}+{y}")
 
-    root.after(4000, root.destroy)
-    root.mainloop()
+    popup.after(4000, popup.destroy)
 
 
-def alert_bad_posture(vertex_angle):
+def alert_bad_posture(calib_window, vertex_angle):
     message = random.choice(BAD_POSTURE_MESSAGES)
-    threading.Thread(target=_show_posture_popup, args=(message,), daemon=True).start()
+    _show_posture_popup(calib_window, message)
 
 
 class CalibrationWindow:
@@ -871,6 +893,33 @@ class CalibrationWindow:
             self.root.destroy()
         except tk.TclError:
             pass
+
+    def hide(self):
+        """
+        Withdraws the window without destroying it, so it can be reopen()'d
+        later for a mid-session prompt (e.g. switching models) without
+        creating a second Tk() root - Tcl only tolerates one per process, and
+        a second one racing this one is what produces the
+        Tcl_AsyncDelete "wrong thread" crash.
+        """
+        if self.closed:
+            return
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            self.closed = True
+            self._destroyed = True
+
+    def reopen(self):
+        """Redisplays a window previously hidden via hide()."""
+        if self.closed:
+            return
+        try:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            self.closed = True
+            self._destroyed = True
 
 
 def _play_beep(calib_window):
@@ -1242,7 +1291,10 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
                                 calibration_debug_stats,
                             )
     finally:
-        calib_window.close()
+        # Hidden, not destroyed - kept alive as the one shared Tk root for
+        # the whole session, reused later by the switch-model dialog and
+        # posture-alert popups instead of spinning up a second Tk() root.
+        calib_window.hide()
 
     if calib_window.closed_by_user:
         sys.exit(0)
@@ -1273,6 +1325,11 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
         if not ret:
             print("Could not read frame.")
             break
+
+        # Drives any active posture-alert Toplevel (rendering it and running
+        # its after()-scheduled auto-dismiss) - harmless no-op the rest of
+        # the time, since calib_window itself stays hidden between prompts.
+        calib_window.pump()
 
         frame_height = frame.shape[0]
 
@@ -1347,7 +1404,7 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
                     now - bad_posture_since >= SUSTAINED_BAD_POSTURE_SEC
                     and now - last_posture_alert_time > NECK_VERTEX_ALERT_COOLDOWN_SEC
                 ):
-                    alert_bad_posture(vertex_angle)
+                    alert_bad_posture(calib_window, vertex_angle)
                     last_posture_alert_time = now
             else:
                 # A single noisy frame reading as "fine" shouldn't wipe out an
@@ -1436,7 +1493,7 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
         if switch_model_button["clicked"]:
             switch_model_button["clicked"] = False
-            result = prompt_model_switch(available_models)
+            result = prompt_model_switch(calib_window, available_models)
             if result is not None:
                 current_model_name, slouch_model = result
                 bad_posture_since = None
@@ -1463,3 +1520,4 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
 cap.release()
 cv2.destroyAllWindows()
+calib_window.close()
