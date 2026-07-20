@@ -538,13 +538,15 @@ def prompt_model_switch(calib_window, available_models):
     Reuses that one root rather than creating a second Tk() - Tcl only
     tolerates one live root/thread at a time, and a second one here would
     race it exactly the way alert_bad_posture's old threaded popup did (see
-    its docstring). Returns (model_name, slouch_model) for the user's pick,
-    or None if there was nothing to apply (dialog closed without choosing,
-    or the window was destroyed because the user closed it via its own
-    window-manager close button - in which case it can't be reopened again
-    for the rest of the session).
+    its docstring). With exit_on_close now False, dismissing this dialog via
+    its own window-manager close button just cancels it (hides, doesn't
+    destroy) - same outcome as clicking no button at all. Returns
+    (model_name, slouch_model) for the user's pick, or None if they closed
+    the dialog or picked the model already in use.
     """
     if calib_window.closed:
+        # Only reachable if the shared root itself broke (e.g. a TclError
+        # during pump()), not from the user just closing this dialog.
         print("Calibration window is no longer available; can't switch models.")
         return None
 
@@ -775,11 +777,22 @@ class CalibrationWindow:
         self.closed = False
         self.closed_by_user = False
         self._destroyed = False
+        self._cancelled = False
+        # True during the startup dialogs, where closing the window means the
+        # user is opting out entirely (main() exits). Set False once startup
+        # finishes and this window becomes the shared, session-long root
+        # reused for mid-session prompts (switch-model) and alert popups -
+        # closing it there should just cancel that one prompt, not tear down
+        # the shared root the rest of the session depends on.
+        self.exit_on_close = True
 
     def _on_close(self):
-        self._response = False
-        self.closed_by_user = True
-        self.close()
+        self._cancelled = True
+        if self.exit_on_close:
+            self.closed_by_user = True
+            self.close()
+        else:
+            self.hide()
 
     def pump(self):
         if self.closed:
@@ -831,7 +844,8 @@ class CalibrationWindow:
         self._autosize()
 
     def _wait_for_response(self):
-        while self._response is None and not self.closed:
+        self._cancelled = False
+        while self._response is None and not self.closed and not self._cancelled:
             self.pump()
             time.sleep(0.01)
         return self._response
@@ -1295,6 +1309,11 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
         # the whole session, reused later by the switch-model dialog and
         # posture-alert popups instead of spinning up a second Tk() root.
         calib_window.hide()
+        # From here on, closing this window (e.g. dismissing a mid-session
+        # switch-model prompt) should just cancel that one prompt and keep
+        # the current model, not exit the whole app the way closing it
+        # during the startup dialogs above does.
+        calib_window.exit_on_close = False
 
     if calib_window.closed_by_user:
         sys.exit(0)
