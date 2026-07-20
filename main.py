@@ -17,6 +17,8 @@ import traceback
 from tkinter import messagebox
 
 import cv2
+import joblib
+import pandas as pd
 from rtmlib import Body
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -100,11 +102,17 @@ def set_window_icon(window_title, icon_path):
 
 CALIBRATION_ICON_PATH = resource_path("images", "SlouchImageopt.png")
 APP_ICON_PATH = resource_path("images", "SlouchLess.ico")
+SLOUCH_MODEL_PATH = resource_path("models", "slouch_classifier.joblib")
+MODEL_TYPE_LABELS = {
+    "mlp": "Neural Net (MLP)",
+    "svm_rbf": "SVM (RBF kernel)",
+    "random_forest": "Random Forest",
+}
 VIDEO_WINDOW_NAME = "SlouchLess"
 # default is 123.
 NECK_VERTEX_ALERT_THRESHOLD_DEG = 123
 NECK_VERTEX_ALERT_COOLDOWN_SEC = 15
-SUSTAINED_BAD_POSTURE_SEC = 2
+SUSTAINED_BAD_POSTURE_SEC = 5
 GOOD_POSTURE_GRACE_SEC = 1
 CVA_ANGLE_ALERT_THRESHOLD_DEG = 85.0
 NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = 60.0
@@ -331,6 +339,65 @@ def angle_from_horizontal(point_a, point_b):
     return math.degrees(math.atan2(abs(dy), abs(dx)))
 
 
+def compute_ml_feature_row(selected, vertex_angle, cva_angle, shoulder_tilt_angle, ear_tilt_angle, is_camera_above):
+    """
+    Assembles the same relative, camera-distance-invariant feature set
+    train_slouch_classifier.py trains its model on, reusing the angles
+    already computed per-frame for the on-screen overlay rather than
+    recomputing them. Returns None if any of those angles couldn't be
+    computed (e.g. overlapping landmarks), so the caller can skip ML
+    inference for that frame instead of feeding the model garbage.
+    """
+    if None in (vertex_angle, cva_angle, shoulder_tilt_angle, ear_tilt_angle):
+        return None
+
+    left_shoulder = selected["left_shoulder"]
+    right_shoulder = selected["right_shoulder"]
+    shoulder_width = max(
+        math.hypot(right_shoulder["px"] - left_shoulder["px"], right_shoulder["py"] - left_shoulder["py"]), 1.0
+    )
+    nose = selected["nose"]
+    neck = selected["neck"]
+    nose_neck_dist_norm = math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"]) / shoulder_width
+    left_ear = selected["left_ear"]
+    right_ear = selected["right_ear"]
+    left_ear_shoulder_dist = math.hypot(left_ear["px"] - left_shoulder["px"], left_ear["py"] - left_shoulder["py"])
+    right_ear_shoulder_dist = math.hypot(right_ear["px"] - right_shoulder["px"], right_ear["py"] - right_shoulder["py"])
+    head_tuck_dist_norm = (left_ear_shoulder_dist + right_ear_shoulder_dist) / 2 / shoulder_width
+    # Plain sum()/len() rather than statistics.mean(): the neck landmark's
+    # visibility is a numpy.float32 (from _estimate_neck's average of raw
+    # model scores) while the others are plain floats, and statistics.mean's
+    # strict type coercion rejects that mix.
+    visibilities = [lm["visibility"] for lm in selected.values()]
+    avg_visibility = sum(visibilities) / len(visibilities)
+
+    return {
+        "vertex_angle_deg": vertex_angle,
+        "cva_angle_deg": cva_angle,
+        "nose_neck_dist_norm": nose_neck_dist_norm,
+        "shoulder_tilt_deg": shoulder_tilt_angle,
+        "ear_tilt_deg": ear_tilt_angle,
+        "head_tuck_dist_norm": head_tuck_dist_norm,
+        "avg_visibility": avg_visibility,
+        "camera_position_above": 1.0 if is_camera_above else 0.0,
+        "camera_position_below": 0.0 if is_camera_above else 1.0,
+        "camera_position_unknown": 0.0,
+    }
+
+
+def predict_slouch(slouch_model, feature_row):
+    """
+    Returns True/False for whether `feature_row` is predicted as slouching.
+    Passed as a one-row DataFrame using the model's own trained-on column
+    names/order (from the loaded bundle, not hardcoded here), since the
+    model was fit on a DataFrame and predicting from a plain array instead
+    triggers a sklearn UserWarning about missing feature names.
+    """
+    feature_columns = slouch_model["feature_columns"]
+    row_df = pd.DataFrame([feature_row], columns=feature_columns)
+    return bool(slouch_model["model"].predict(row_df)[0])
+
+
 def draw_skeleton(frame, keypoints, scores, kpt_thr=0.3):
     if len(keypoints) == 0:
         return
@@ -404,6 +471,59 @@ def save_calibration_settings(path, threshold, cva_threshold, distance_threshold
 NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = load_calibration_settings(
     CALIBRATION_FILE, NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
 )
+
+
+def load_slouch_model(path):
+    """
+    Loads the classifier trained by train_slouch_classifier.py, if one has
+    been trained yet. Returns None (the caller then falls back to the
+    calibrated angle/distance thresholds) if no model file exists or it
+    fails to load for any reason - training a model is optional, so its
+    absence isn't an error.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        return joblib.load(path)
+    except Exception as e:
+        print(f"Could not load slouch model at {path} ({e}); using calibrated thresholds instead.")
+        return None
+
+
+def resolve_slouch_model_path(is_camera_above):
+    """
+    Fallback for when discover_available_models() finds no per-type .joblib
+    files at all (e.g. only the older combined-model naming scheme was ever
+    trained). Prefers a model trained specifically for this camera position
+    (via `train_slouch_classifier.py --camera-position above` or `below`),
+    since that's a real feature the model was trained on. Falls back to the
+    combined "all positions" model if no position-specific one has been
+    trained yet.
+    """
+    position = "above" if is_camera_above else "below"
+    position_specific_path = resource_path("models", f"slouch_classifier_{position}.joblib")
+    if os.path.exists(position_specific_path):
+        return position_specific_path
+    return SLOUCH_MODEL_PATH
+
+
+def discover_available_models(position):
+    """
+    Looks up each model type in MODEL_TYPE_LABELS (kept in sync with
+    train_slouch_classifier.py's --model choices) under the filename
+    convention model_file_for() there uses: models/slouch_classifier_
+    {position}_{model_name}.joblib. Only types whose .joblib actually exists
+    on disk are returned, so the picker never offers a model that isn't
+    there to load.
+
+    Returns {model_name: model_file_path}, in MODEL_TYPE_LABELS order.
+    """
+    available = {}
+    for model_name in MODEL_TYPE_LABELS:
+        model_file = resource_path("models", f"slouch_classifier_{position}_{model_name}.joblib")
+        if os.path.exists(model_file):
+            available[model_name] = model_file
+    return available
 
 
 def _v4l2_supports_capture(device_path):
@@ -682,6 +802,25 @@ class CalibrationWindow:
         self._autosize()
 
         return bool(self._wait_for_response())
+
+    def ask_choice(self, message, choices):
+        """
+        Shows `message` with one button per (key, label) pair in `choices`
+        (in order) and blocks until one is clicked. Returns the chosen key,
+        or None if the window was closed without a selection.
+        """
+        self.set_message(message)
+        self.countdown_label.config(text="")
+        self._clear_buttons()
+        self._response = None
+
+        for key, label in choices:
+            tk.Button(
+                self.button_frame, text=label, width=30, command=lambda k=key: setattr(self, "_response", k)
+            ).pack(padx=10, pady=4)
+        self._autosize()
+
+        return self._wait_for_response()
 
     def wait_for_start(self, message, button_text="Start"):
         """Shows `message` with a single button and blocks until clicked. Returns True/False (False if window closed)."""
@@ -1021,33 +1160,56 @@ pose_estimator = Body(mode="lightweight", backend="onnxruntime", device="cpu")
 with contextlib.nullcontext(pose_estimator) as landmarker:
     calib_window = CalibrationWindow()
     try:
-        USE_NECK_VERTEX_ANGLE = calib_window.ask_yes_no(
+        is_camera_above = calib_window.ask_yes_no(
             "When you're sat normally, is the camera positioned above the midpoint in front of you, or below it?",
             yes_text="Above",
             no_text="Below",
         )
+        # USE_NECK_VERTEX_ANGLE also drives which threshold formula the
+        # non-ML fallback below uses - it's the same underlying answer, just
+        # under the name the original threshold logic already expects.
+        USE_NECK_VERTEX_ANGLE = is_camera_above
 
-        calibrate_choice = not calib_window.closed and calib_window.ask_yes_no(
-            "Would you like to calibrate posture thresholds for this session?"
-        )
-        if calibrate_choice and check_volume_and_warn(calib_window):
-            calibrated_threshold, calibrated_cva_threshold, calibrated_distance_threshold, calibration_debug_stats = run_calibration(
-                cap, landmarker, calib_window
+        position = "above" if is_camera_above else "below"
+        available_models = discover_available_models(position)
+
+        slouch_model_path = None
+        if available_models and not calib_window.closed:
+            chosen_model_name = calib_window.ask_choice(
+                "Select which trained model to use:",
+                [(name, MODEL_TYPE_LABELS.get(name, name)) for name in available_models],
             )
-            if calibrated_threshold is not None:
-                NECK_VERTEX_ALERT_THRESHOLD_DEG = calibrated_threshold
-                CVA_ANGLE_ALERT_THRESHOLD_DEG = calibrated_cva_threshold
-                NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = calibrated_distance_threshold
-                if not calib_window.closed:
-                    save_choice = calib_window.ask_yes_no("Save these as your permanent posture settings?")
-                    if save_choice:
-                        save_calibration_settings(
-                            CALIBRATION_FILE,
-                            calibrated_threshold,
-                            calibrated_cva_threshold,
-                            calibrated_distance_threshold,
-                            calibration_debug_stats,
-                        )
+            if chosen_model_name is not None:
+                slouch_model_path = available_models[chosen_model_name]
+
+        if slouch_model_path is None:
+            slouch_model_path = resolve_slouch_model_path(is_camera_above)
+        slouch_model = load_slouch_model(slouch_model_path)
+
+        if slouch_model is not None:
+            print(f"Loaded trained slouch model from {slouch_model_path}; skipping threshold calibration.")
+        else:
+            calibrate_choice = not calib_window.closed and calib_window.ask_yes_no(
+                "Would you like to calibrate posture thresholds for this session?"
+            )
+            if calibrate_choice and check_volume_and_warn(calib_window):
+                calibrated_threshold, calibrated_cva_threshold, calibrated_distance_threshold, calibration_debug_stats = run_calibration(
+                    cap, landmarker, calib_window
+                )
+                if calibrated_threshold is not None:
+                    NECK_VERTEX_ALERT_THRESHOLD_DEG = calibrated_threshold
+                    CVA_ANGLE_ALERT_THRESHOLD_DEG = calibrated_cva_threshold
+                    NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = calibrated_distance_threshold
+                    if not calib_window.closed:
+                        save_choice = calib_window.ask_yes_no("Save these as your permanent posture settings?")
+                        if save_choice:
+                            save_calibration_settings(
+                                CALIBRATION_FILE,
+                                calibrated_threshold,
+                                calibrated_cva_threshold,
+                                calibrated_distance_threshold,
+                                calibration_debug_stats,
+                            )
     finally:
         calib_window.close()
 
@@ -1104,19 +1266,29 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
             cva_angle = angle_from_horizontal(neck, nose)
             nose_neck_distance = math.hypot(nose["px"] - neck["px"], nose["py"] - neck["py"])
 
-            is_bad_posture_frame = monitoring_enabled and (
-                (
-                    USE_NECK_VERTEX_ANGLE
-                    and vertex_angle is not None
-                    and vertex_angle > NECK_VERTEX_ALERT_THRESHOLD_DEG
+            if slouch_model is not None:
+                shoulder_tilt_angle = angle_from_horizontal(selected["left_shoulder"], selected["right_shoulder"])
+                ear_tilt_angle = angle_from_horizontal(selected["left_ear"], selected["right_ear"])
+                feature_row = compute_ml_feature_row(
+                    selected, vertex_angle, cva_angle, shoulder_tilt_angle, ear_tilt_angle, is_camera_above
                 )
-                or (
-                    not USE_NECK_VERTEX_ANGLE
-                    and cva_angle is not None
-                    and cva_angle < CVA_ANGLE_ALERT_THRESHOLD_DEG
-                    and nose_neck_distance >= NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
+                is_bad_posture_frame = (
+                    monitoring_enabled and feature_row is not None and predict_slouch(slouch_model, feature_row)
                 )
-            )
+            else:
+                is_bad_posture_frame = monitoring_enabled and (
+                    (
+                        USE_NECK_VERTEX_ANGLE
+                        and vertex_angle is not None
+                        and vertex_angle > NECK_VERTEX_ALERT_THRESHOLD_DEG
+                    )
+                    or (
+                        not USE_NECK_VERTEX_ANGLE
+                        and cva_angle is not None
+                        and cva_angle < CVA_ANGLE_ALERT_THRESHOLD_DEG
+                        and nose_neck_distance >= NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
+                    )
+                )
 
             now = time.time()
             if is_bad_posture_frame:
@@ -1145,6 +1317,7 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
             # Show all angles stacked in the top-left corner
             overlay_lines = []
+            overlay_lines.append(f"posture detection: {'ML model' if slouch_model is not None else 'calibrated thresholds'}")
             if vertex_angle is not None:
                 overlay_lines.append(f"neck vertex angle: {vertex_angle:.1f} deg")
             if left_angle is not None:
@@ -1167,18 +1340,9 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
                     cv2.LINE_AA,
                 )
 
-            # Print extracted values once per second
             now = time.time()
-            if now - last_print_time > 1.0:
-                print("\nSelected posture landmarks:")
-                for name, data in selected.items():
-                    print(
-                        f"{name:15s} "
-                        f"px={data['px']:4d}, py={data['py']:4d}, "
-                        f"visibility={data['visibility']:.2f}"
-                    )
-                for line in overlay_lines:
-                    print(line)
+            if now - last_print_time > 5.0:
+                print("slouch" if is_bad_posture_frame else "no slouch")
                 last_print_time = now
 
         if not monitoring_enabled:
