@@ -1,24 +1,25 @@
-
-absl-py==2.5.0
-certifi==2024.8.30
-cffi==2.0.0
-comtypes==1.4.16
-contourpy==1.3.0
-cycler==0.12.1
-flatbuffers==25.12.19
-fonttools==4.54.1
-kiwisolver==1.4.7
-matplotlib==3.9.2
-mediapipe==0.10.35
+joblib==1.4.2
+# Requires Python 3.11+ (onnxruntime>=1.24, needed for NumPy 2.x support,
+# only ships wheels for 3.11+). On a 3.10-or-older interpreter, pip silently
+# resolves an older onnxruntime instead - one whose compiled wheel crashes
+# with "AttributeError: _ARRAY_API not found" against NumPy 2.x (a C-API ABI
+# break its build predates), even though its metadata loosely allows
+# numpy>=1.21.6. NumPy 2.x is required here, not just tolerated: the trained
+# .joblib models were pickled under it, and their pickled arrays reference
+# numpy._core (renamed from numpy.core in 2.0) - they fail to unpickle
+# ("No module named 'numpy._core'") under NumPy 1.x. opencv-contrib-python
+# isn't used - nothing here touches its contrib-only modules - so plain
+# opencv-python is used instead (already pulled in transitively by rtmlib
+# anyway - installing both together is its own source of conflicts).
 numpy==2.0.2
-opencv-contrib-python==5.0.0.93
-packaging==24.1
-pillow==10.4.0
-psutil==7.2.2
+onnxruntime==1.27.0
+opencv-python==4.10.0.84
+pandas==2.2.3
+rtmlib==0.0.15
+scikit-learn==1.5.2
+
+# Windows only - the below/above camera picker, volume check, and beep all
+# have Linux fallbacks (v4l2 sysfs, pactl, Tk bell()) that don't need these.
+comtypes==1.4.16 ; sys_platform == "win32"
 pycaw==20251023 ; sys_platform == "win32"
-pycparser==3.0
 pygrabber==0.2 ; sys_platform == "win32"
-pyparsing==3.1.4
-python-dateutil==2.9.0.post0
-six==1.16.0
-sounddevice==0.5.5
