@@ -3,25 +3,25 @@
 SlouchLess is a lightweight desktop app that watches your posture through your camera and nudges you when you start slouching.
 
 ### How it works
-- Uses [MediaPipe](https://developers.google.com/mediapipe) pose detection to track your neck, shoulders, and head position in real time.
-- A short guided calibration (sit upright, then slouch on cue) learns *your* personal posture thresholds instead of relying on one-size-fits-all defaults.
+- Uses [RTMPose](https://github.com/Tau-J/rtmlib) pose detection to track your neck, shoulders, and head position in real time.
+- Lets you pick a pre-trained posture-detection model (neural net, SVM, or random forest) at startup, or fall back to a short guided calibration (sit upright, then slouch on cue) that measures your own upright vs. slouched posture to set personal alert thresholds. You can switch between them mid-session from the "Switch Model" button on the video window.
 - Adapts its detection method to where your webcam actually sits - above your monitor or below it - since that changes which signals are reliable.
 - Pops up a (mildly judgmental) reminder once it's confident you've been slouching for some time.
 
 ## Just want to run it?
 
-Download the prebuilt binary for your OS from the [Releases page](https://github.com/thisishale/SlouchLess/releases/tag/v1.0.0).
+Download the prebuilt binary for your OS from the [Releases page](https://github.com/thisishale/SlouchLess/releases/tag/v2.0.0).
 
 ## Running from source
 
 Requirements:
-- Python 3.9+ (developed/tested on 3.12)
+- Python 3.11+ (developed/tested on 3.12). 
 - A webcam or built-in camera
 - **Linux only**: a few system packages not covered by pip:
   ```bash
-  sudo apt install python3-tk libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+  sudo apt install python3-tk libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 pulseaudio-utils
   ```
-  (`python3-tk` for the calibration UI, the rest for OpenCV's display window)
+
 
 Setup:
 
