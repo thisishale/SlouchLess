@@ -192,6 +192,14 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
     cv2.setMouseCallback(VIDEO_WINDOW_NAME, on_video_mouse)
 
+    # cv2 never centers its own windows - left alone, window managers place
+    # it wherever their own default policy says (observed pushed to the
+    # right edge under GNOME/Wayland via XWayland, though acceptable by
+    # coincidence on Windows). Centered explicitly instead, once the frame
+    # size is known, using the same screen-size query the Tk dialogs already
+    # use (calib_window.root is still alive, just hidden, at this point).
+    video_window_positioned = False
+
     while True:
         ret, frame = cap.read()
 
@@ -205,6 +213,15 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
         calib_window.pump()
 
         frame_height = frame.shape[0]
+
+        if not video_window_positioned:
+            frame_width = frame.shape[1]
+            screen_width = calib_window.root.winfo_screenwidth()
+            screen_height = calib_window.root.winfo_screenheight()
+            x = max(0, (screen_width - frame_width) // 2)
+            y = max(0, (screen_height - frame_height) // 2)
+            cv2.moveWindow(VIDEO_WINDOW_NAME, x, y)
+            video_window_positioned = True
 
         keypoints, scores = landmarker(frame)
 

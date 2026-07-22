@@ -9,12 +9,13 @@ datas = [
 ] + [(model_file, 'models') for model_file in glob.glob('models/*.joblib')]
 binaries = []
 # joblib.load() unpickles trained models by dynamically importing internal
-# sklearn submodules (e.g. sklearn.neural_network._multilayer_perceptron)
-# that are only referenced inside the pickled data, not as literal imports
-# in this project's own source - PyInstaller's static analysis misses them,
-# so joblib.load() silently throws in the frozen exe and load_slouch_model()
-# falls back to calibrated thresholds no matter which model was picked.
-hiddenimports = collect_submodules('sklearn')
+# sklearn and numpy submodules (e.g. sklearn.neural_network._multilayer_
+# perceptron, numpy._core) that are only referenced inside the pickled data,
+# not as literal imports in this project's own source - PyInstaller's static
+# analysis misses them, so joblib.load() silently throws in the frozen exe
+# and load_slouch_model() falls back to calibrated thresholds no matter
+# which model was picked ("No module named 'sklearn...'" / "'numpy._core'").
+hiddenimports = collect_submodules('sklearn') + collect_submodules('numpy')
 
 
 a = Analysis(
