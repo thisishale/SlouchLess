@@ -17,6 +17,7 @@ from pose_math import angle_from_horizontal, extract_landmarks, is_person_presen
 from slouch_model import (
     MODEL_TYPE_LABELS,
     SWITCH_MODEL_BUTTON_LABEL,
+    THRESHOLDS_CHOICE_KEY,
     compute_ml_feature_row,
     discover_available_models,
     load_slouch_model,
@@ -86,44 +87,77 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
 
         slouch_model_path = None
         chosen_model_name = None
+        wants_calibrated_thresholds = False
         if available_models and not calib_window.closed:
-            chosen_model_name = calib_window.ask_choice(
-                "Select which trained model to use:",
-                [(name, MODEL_TYPE_LABELS.get(name, name)) for name in available_models],
-            )
-            if chosen_model_name is not None:
-                slouch_model_path = available_models[chosen_model_name]
+            choices = [(name, MODEL_TYPE_LABELS.get(name, name)) for name in MODEL_TYPE_LABELS if name in available_models]
+            choices.append((THRESHOLDS_CHOICE_KEY, "Calibrated thresholds"))
+            picked = calib_window.ask_choice("Select which trained model to use:", choices)
+            if picked == THRESHOLDS_CHOICE_KEY:
+                wants_calibrated_thresholds = True
+            elif picked is not None:
+                chosen_model_name = picked
+                slouch_model_path = available_models[picked]
 
-        if slouch_model_path is None:
+        if slouch_model_path is None and not wants_calibrated_thresholds:
             slouch_model_path = resolve_slouch_model_path(is_camera_above)
             chosen_model_name = None  # legacy fallback path isn't one of the fixed MODEL_TYPE_LABELS entries
-        slouch_model = load_slouch_model(slouch_model_path)
+        slouch_model = load_slouch_model(slouch_model_path) if slouch_model_path is not None else None
         current_model_name = chosen_model_name if slouch_model is not None else None
+
+        def maybe_calibrate_thresholds(cva_threshold, distance_threshold):
+            """
+            Asks whether to calibrate posture thresholds for this session and,
+            if so, runs the calibration flow and offers to save the results
+            permanently. Returns (threshold, cva_threshold, distance_threshold)
+            with the new values, or None if the user declined, aborted, or
+            nothing usable was collected - callers should leave the existing
+            thresholds untouched in that case. Shared by both the startup flow
+            below and the mid-session "Switch Model" -> "Calibrated thresholds"
+            path, so recalibrating is offered consistently either way.
+            """
+            # Reopen defensively: harmless (and a no-op) during the startup
+            # flow where calib_window is already shown, but essential for the
+            # mid-session "Switch Model" -> "Calibrated thresholds" path,
+            # where prompt_model_switch() already hid the window again right
+            # after that choice - without this, ask_yes_no() below would wait
+            # forever for a click on a window nobody can see, looking exactly
+            # like a freeze.
+            calib_window.reopen()
+            try:
+                calibrate_choice = not calib_window.closed and calib_window.ask_yes_no(
+                    "Would you like to calibrate posture thresholds for this session?"
+                )
+                if not (calibrate_choice and check_volume_and_warn(calib_window)):
+                    return None
+
+                calibrated_threshold, calibrated_cva_threshold, calibrated_distance_threshold, calibration_debug_stats = run_calibration(
+                    cap, landmarker, calib_window, cva_threshold, distance_threshold
+                )
+                if calibrated_threshold is None:
+                    return None
+
+                if not calib_window.closed:
+                    save_choice = calib_window.ask_yes_no("Save these as your permanent posture settings?")
+                    if save_choice:
+                        save_calibration_settings(
+                            CALIBRATION_FILE,
+                            calibrated_threshold,
+                            calibrated_cva_threshold,
+                            calibrated_distance_threshold,
+                            calibration_debug_stats,
+                        )
+
+                return calibrated_threshold, calibrated_cva_threshold, calibrated_distance_threshold
+            finally:
+                if not calib_window.closed:
+                    calib_window.hide()
 
         if slouch_model is not None:
             print(f"Loaded trained slouch model from {slouch_model_path}; skipping threshold calibration.")
         else:
-            calibrate_choice = not calib_window.closed and calib_window.ask_yes_no(
-                "Would you like to calibrate posture thresholds for this session?"
-            )
-            if calibrate_choice and check_volume_and_warn(calib_window):
-                calibrated_threshold, calibrated_cva_threshold, calibrated_distance_threshold, calibration_debug_stats = run_calibration(
-                    cap, landmarker, calib_window, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX
-                )
-                if calibrated_threshold is not None:
-                    NECK_VERTEX_ALERT_THRESHOLD_DEG = calibrated_threshold
-                    CVA_ANGLE_ALERT_THRESHOLD_DEG = calibrated_cva_threshold
-                    NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = calibrated_distance_threshold
-                    if not calib_window.closed:
-                        save_choice = calib_window.ask_yes_no("Save these as your permanent posture settings?")
-                        if save_choice:
-                            save_calibration_settings(
-                                CALIBRATION_FILE,
-                                calibrated_threshold,
-                                calibrated_cva_threshold,
-                                calibrated_distance_threshold,
-                                calibration_debug_stats,
-                            )
+            calibration_result = maybe_calibrate_thresholds(CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX)
+            if calibration_result is not None:
+                NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = calibration_result
     finally:
         # Hidden, not destroyed - kept alive as the one shared Tk root for
         # the whole session, reused later by the switch-model dialog and
@@ -341,6 +375,9 @@ with contextlib.nullcontext(pose_estimator) as landmarker:
                     print(f"Switched posture detection to {MODEL_TYPE_LABELS.get(current_model_name, current_model_name)} model.")
                 else:
                     print("Switched posture detection to calibrated thresholds.")
+                    calibration_result = maybe_calibrate_thresholds(CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX)
+                    if calibration_result is not None:
+                        NECK_VERTEX_ALERT_THRESHOLD_DEG, CVA_ANGLE_ALERT_THRESHOLD_DEG, NOSE_NECK_DISTANCE_ALERT_THRESHOLD_PX = calibration_result
 
         # Press q to quit
         if cv2.waitKey(1) & 0xFF == ord("q"):

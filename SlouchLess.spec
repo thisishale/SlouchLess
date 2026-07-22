@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+import glob
 
-datas = [('pose_landmarker_lite.task', '.'), ('images/SlouchImageopt.png', 'images'), ('images/SlouchLess.ico', 'images')]
+from PyInstaller.utils.hooks import collect_submodules
+
+datas = [
+    ('images/SlouchImageopt.png', 'images'),
+    ('images/SlouchLess.ico', 'images'),
+] + [(model_file, 'models') for model_file in glob.glob('models/*.joblib')]
 binaries = []
-hiddenimports = []
-tmp_ret = collect_all('mediapipe')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# joblib.load() unpickles trained models by dynamically importing internal
+# sklearn submodules (e.g. sklearn.neural_network._multilayer_perceptron)
+# that are only referenced inside the pickled data, not as literal imports
+# in this project's own source - PyInstaller's static analysis misses them,
+# so joblib.load() silently throws in the frozen exe and load_slouch_model()
+# falls back to calibrated thresholds no matter which model was picked.
+hiddenimports = collect_submodules('sklearn')
 
 
 a = Analysis(
